@@ -19,19 +19,6 @@ class ConfidenceInfo:
     conf_threshold: float
 
 
-# This function is used to fake expand the logprobs_dict to the topk size
-# TODO: remove this function after the topk logprobs is supported with torch backend
-def fake_expand_logprobs_dict(logprobs_dict: Mapping[int, 'Logprob'],
-                              topk: int):
-    for token_id, logprob in logprobs_dict.items():
-        real_token_id = token_id
-
-    for i in range(topk - 1):
-        new_logprob = copy.deepcopy(logprob)
-        new_logprob.logprob = new_logprob.logprob / (i + 1)
-        logprobs_dict[real_token_id + i + 1] = new_logprob
-
-
 def update_confidence_info(confidence_info: ConfidenceInfo,
                            token_dict: Mapping[int, 'Logprob'], token_id: int):
     #print("fredw test update_confidence_info len(token_dict): " + str(len(token_dict)))
@@ -73,11 +60,9 @@ class DeepConfOfflineController(NativeGenerationController):
     def process(self, tasks: List[Task], **kwargs):
         assert len(
             tasks) == 1, "DeepConfOfflineController only supports one task"
-        tasks[0].num_logprobs = self.logprobs_topk
         yield from super().process(tasks, **kwargs)
         for logprobs_dict, token_id in zip(tasks[0].logprobs,
                                            tasks[0].output_tokens):
-            fake_expand_logprobs_dict(logprobs_dict, self.logprobs_topk)
             update_confidence_info(self.confidence_info, logprobs_dict,
                                    token_id)
         tasks[0].costimized_result_fields[
@@ -117,7 +102,6 @@ class DeepConfOnlineController(Controller):
             tasks) == 1, "DeepThinkOnlineController only supports one task"
         online_task = StreamGenerationTask.create_from_generation_task(tasks[0])
         online_task.streaming_step = self.confidence_info.conf_group_size
-        online_task.num_logprobs = self.logprobs_topk
         online_task.worker_tag = self.WorkerTag.GENERATION
 
         for key, value in self.sampling_params.items():
@@ -130,7 +114,6 @@ class DeepConfOnlineController(Controller):
             for i in range(last_step_index, len(online_task.output_tokens)):
                 logprobs_dict, token_id = online_task.logprobs[
                     i], online_task.output_tokens[i]
-                fake_expand_logprobs_dict(logprobs_dict, self.logprobs_topk)
                 update_confidence_info(self.confidence_info, logprobs_dict,
                                        token_id)
             if self.should_stop(self.confidence_info):

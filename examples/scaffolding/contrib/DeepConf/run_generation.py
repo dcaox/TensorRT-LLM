@@ -30,25 +30,31 @@ def run_scaffolding_llm(prompts, proposer_worker, controller):
     llm.shutdown(shutdown_workers=False)
 
 
-def test_offline_controller(prompts, proposer_worker):
-    prototype_controller = DeepConfOfflineController(conf_group_size=10,
-                                                     conf_threshold=0.5,
-                                                     logprobs_topk=20,
-                                                     sampling_params={
-                                                         "temperature": 0.9,
-                                                         "max_tokens": 1024,
-                                                     })
+def test_offline_controller(prompts, proposer_worker, logprobs_topk=20):
+    prototype_controller = DeepConfOfflineController(
+        conf_group_size=10,
+        conf_threshold=0.5,
+        logprobs_topk=logprobs_topk,
+        sampling_params={
+            "temperature": 0.9,
+            "max_tokens": 1024,
+            "num_logprobs": logprobs_topk,
+        })
 
     run_scaffolding_llm(prompts, proposer_worker, prototype_controller)
 
 
-def test_online_controller(prompts, proposer_worker):
+def test_online_controller(prompts, proposer_worker, logprobs_topk=20):
     prototype_controller = DeepConfOnlineController(conf_group_size=10,
                                                     conf_threshold=0.5,
-                                                    logprobs_topk=20,
+                                                    logprobs_topk=logprobs_topk,
                                                     sampling_params={
-                                                        "temperature": 0.9,
-                                                        "max_tokens": 1024,
+                                                        "temperature":
+                                                        0.9,
+                                                        "max_tokens":
+                                                        1024,
+                                                        "num_logprobs":
+                                                        logprobs_topk,
                                                     })
 
     run_scaffolding_llm(prompts, proposer_worker, prototype_controller)
@@ -70,8 +76,9 @@ def main():
         max_num_tokens=4096,
     )
 
-    test_offline_controller(prompts, llm_worker)
-    test_online_controller(prompts, llm_worker)
+    logprobs_topk = 20
+    test_offline_controller(prompts, llm_worker, logprobs_topk=logprobs_topk)
+    test_online_controller(prompts, llm_worker, logprobs_topk=logprobs_topk)
 
     llm_worker.shutdown()
     print('llm worker shutdown done')
