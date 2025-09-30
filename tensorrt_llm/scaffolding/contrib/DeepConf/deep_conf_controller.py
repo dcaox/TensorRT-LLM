@@ -1,13 +1,13 @@
 import copy
-from collections import deque
+import random
+from collections import Counter, deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Mapping, Tuple
 
-from tensorrt_llm.scaffolding import (Controller, MajorityVoteController,
-                                      NativeGenerationController,
+from tensorrt_llm.scaffolding import (Controller, NativeGenerationController,
                                       ParallelProcess, StreamGenerationTask,
-                                      Task)
+                                      Task, extract_answer_from_boxed)
 
 
 @dataclass
@@ -21,24 +21,48 @@ class ConfidenceInfo:
 
 def update_confidence_info(confidence_info: ConfidenceInfo,
                            token_dict: Mapping[int, 'Logprob'], token_id: int):
-    #print("fredw test update_confidence_info len(token_dict): " + str(len(token_dict)))
-    if len(token_dict) > 1:
-        sum = 0.0
-        for logprob_token_id, logprob in token_dict.items():
-            if logprob_token_id != token_id:
-                sum += logprob.logprob
-        new_conf = -sum / (len(token_dict) - 1)
-    else:
-        new_conf = 0.0
-
+    new_conf = -sum(logprob_obj.logprob
+                    for logprob_obj in token_dict.values()) / len(token_dict)
     confidence_info.conf_list.append(new_conf)
-
-    if len(confidence_info.conf_group_list) < confidence_info.conf_group_size:
-        confidence_info.conf_grouped += new_conf
-    else:
+    confidence_info.conf_group_list.append(new_conf)
+    confidence_info.conf_grouped += new_conf
+    if len(confidence_info.conf_group_list) > confidence_info.conf_group_size:
         confidence_info.conf_grouped -= confidence_info.conf_group_list.popleft(
         )
-        confidence_info.conf_grouped += new_conf
+
+
+def basic_majority_vote(tasks: List[Task]) -> Task:
+    answers = [
+        task.costimized_result_fields['extracted_answer'] for task in tasks
+    ]
+    majority_answer = Counter(answers).most_common(1)[0][0]
+    return tasks[answers.index(majority_answer)]
+
+
+VOTE_POLICY_IMPL = {
+    'majority': basic_majority_vote,
+}
+
+
+def vote(tasks: List[Task]):
+    for task in tasks:
+        task.costimized_result_fields[
+            'extracted_answer'] = extract_answer_from_boxed(task.output_str)
+    valid_tasks = [
+        task for task in tasks
+        if task.costimized_result_fields['extracted_answer']
+    ]
+    random_return = False
+    if len(valid_tasks) == 0:
+        print(
+            "No valid tasks, maybe you should increase max_output_len, a random task will be returned"
+        )
+        random_return = True
+    return {
+        policy_name:
+        policy_impl(valid_tasks) if not random_return else random.choice(tasks)
+        for policy_name, policy_impl in VOTE_POLICY_IMPL.items()
+    }
 
 
 class DeepConfOfflineController(NativeGenerationController):
@@ -69,13 +93,59 @@ class DeepConfOfflineController(NativeGenerationController):
             'confidence_info'] = self.confidence_info
 
 
-class DeepConfMajorityVoteController(MajorityVoteController):
+class DeepConfOfflineMajorityVoteController(Controller):
 
-    # TODO: implement majority vote
-    # ConfidenceInfo is on costimized_result_fields['confidence_info'] of each task
-    def majority_vote(self, candidates_tasks: List[Task],
-                      **kwargs) -> Tuple[int, str]:
-        pass
+    class WorkerTag(Enum):
+        GENERATION = "generation"
+
+    def __init__(self,
+                 generation_controller: Controller,
+                 sample_num: int,
+                 conf_group_size: int,
+                 conf_threshold: float,
+                 vote_policy: str = 'majority'):
+        super().__init__()
+        self.generation_controller = generation_controller
+        self.sample_num = sample_num
+        self.conf_group_size = conf_group_size
+        self.conf_threshold = conf_threshold
+        self.confidence_info = [
+            ConfidenceInfo(conf_grouped=0.0,
+                           conf_list=[],
+                           conf_group_list=deque([]),
+                           conf_group_size=conf_group_size,
+                           conf_threshold=conf_threshold)
+            for _ in range(self.sample_num)
+        ]
+        self.vote_policy = vote_policy
+
+    def clone(self):
+        return DeepConfOfflineMajorityVoteController(
+            self.generation_controller.clone(), self.sample_num,
+            self.conf_group_size, self.conf_threshold, self.vote_policy)
+
+    def process(self, tasks: List[Task], **kwargs):
+        assert len(
+            tasks) == 1, "DeepConfMajorityVoteController only supports one task"
+        generation_controllers = [
+            self.generation_controller.clone() for _ in range(self.sample_num)
+        ]
+        tasks_list = [copy.deepcopy(tasks) for _ in range(self.sample_num)]
+        generation_kwargs_list = [
+            copy.deepcopy(kwargs) for _ in range(self.sample_num)
+        ]
+        yield ParallelProcess(generation_controllers, tasks_list,
+                              generation_kwargs_list)
+
+        task_list = [tasks[0] for tasks in tasks_list]
+        for i, task in enumerate(task_list):
+            for logprobs_dict, token_id in zip(task.logprobs,
+                                               task.output_tokens):
+                update_confidence_info(self.confidence_info[i], logprobs_dict,
+                                       token_id)
+            task.costimized_result_fields[
+                'confidence_info'] = self.confidence_info[i]
+        tasks[0].result = vote(task_list)[self.vote_policy].result
 
 
 class DeepConfOnlineController(Controller):
@@ -127,10 +197,15 @@ class DeepConfOnlineController(Controller):
 
     # TODO: implement should_stop
     def should_stop(self, confidence_info: ConfidenceInfo) -> bool:
+        if len(confidence_info.conf_group_list
+               ) >= confidence_info.conf_group_size:
+            avg_conf = confidence_info.conf_grouped / len(
+                confidence_info.conf_group_list)
+            return avg_conf < confidence_info.conf_threshold
         return False
 
 
-class AdaptiveMajorityVoteController(Controller):
+class DeepConfOnlineMajorityVoteController(Controller):
 
     def __init__(self, generation_controller: Controller,
                  sample_num_per_round: int, max_sample_num: float):
@@ -140,7 +215,7 @@ class AdaptiveMajorityVoteController(Controller):
         self.max_sample_num = max_sample_num
 
     def clone(self):
-        return AdaptiveMajorityVoteController(
+        return DeepConfOnlineMajorityVoteController(
             self.generation_controller.clone(), self.sample_num,
             self.max_sample_num)
 
