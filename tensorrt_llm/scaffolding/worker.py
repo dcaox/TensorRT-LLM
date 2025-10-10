@@ -151,6 +151,7 @@ class TRTLLMWorker(Worker):
         max_num_tokens: int = 4096,
         kv_cache_free_gpu_memory_fraction: float = 0.9,
         disable_overlap_scheduler: bool = False,
+        scheduler_config=None,
     ):
         kv_cache_config = KvCacheConfig(
             free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction, )
@@ -169,7 +170,8 @@ class TRTLLMWorker(Worker):
                   disable_overlap_scheduler=disable_overlap_scheduler,
                   kv_cache_config=kv_cache_config,
                   max_batch_size=max_batch_size,
-                  max_num_tokens=max_num_tokens)
+                  max_num_tokens=max_num_tokens,
+                  scheduler_config=scheduler_config)
 
         worker = cls(llm, tokenizer)
         worker.own_llm = True
@@ -231,8 +233,10 @@ class TRTLLMWorker(Worker):
             if task.request_handle._done:
                 task.end_flag = True
 
-        sampling_params = self.convert_task_params(task)
+        if getattr(task, 'end_flag', False):
+            return TaskStatus.SUCCESS
         if task.request_handle is None:
+            sampling_params = self.convert_task_params(task)
             task.request_handle = self.llm.generate_async(
                 task.input_str, sampling_params=sampling_params, streaming=True)
             task._result = task.request_handle
