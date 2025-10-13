@@ -135,10 +135,11 @@ class StreamGenerationTask(GenerationTask):
     end_flag: bool = field(default=False)
 
     @staticmethod
-    def create_from_generation_task(
-            task: GenerationTask) -> "StreamGenerationTask":
+    def create_from_generation_task(task: GenerationTask,
+                                    streaming_step) -> "StreamGenerationTask":
         stream_task = StreamGenerationTask()
         stream_task.__dict__ = copy.deepcopy(task.__dict__)
+        stream_task.streaming_step = streaming_step
         return stream_task
 
 

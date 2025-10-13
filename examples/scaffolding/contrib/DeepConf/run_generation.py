@@ -9,6 +9,13 @@ from tensorrt_llm.scaffolding.contrib.DeepConf import (
     DeepConfOfflineController, DeepConfOfflineMajorityVoteController,
     DeepConfOnlineController, DeepConfOnlineMajorityVoteController)
 
+_RUN_TYPE_TO_IMPL = {
+    "offline": DeepConfOfflineController,
+    "online": DeepConfOnlineController,
+    "offline_majority_vote": DeepConfOfflineMajorityVoteController,
+    "online_majority_vote": DeepConfOnlineMajorityVoteController,
+}
+
 
 def parse_arguments():
     parser = argparse.ArgumentParser()
@@ -21,11 +28,14 @@ def parse_arguments():
     parser.add_argument('--run_type',
                         type=str,
                         required=True,
-                        help="Type of the run")
+                        choices=list(_RUN_TYPE_TO_IMPL.keys()),
+                        help="Type of the run. Available choices: %(choices)s")
     parser.add_argument('--sample_num', type=int, default=20)
-    parser.add_argument('--conf_group_size', type=int, default=1024)
+    parser.add_argument('--conf_group_size', type=int, default=128)
     parser.add_argument('--conf_threshold', type=float, default=0.5)
-    parser.add_argument('--vote_policy', type=str, default="majority")
+    parser.add_argument('--vote_policy',
+                        type=str,
+                        default="top10_bottom_window_filtered")
     parser.add_argument('--warmup_sample_num', type=int, default=5)
     parser.add_argument('--confidence_percentile', type=int, default=90)
     parser.add_argument('--logprobs_topk', type=int, default=20)
@@ -40,7 +50,6 @@ def run_scaffolding_llm(prompts, proposer_worker, controller):
     llm = ScaffoldingLlm(
         controller,
         {
-            DeepConfOnlineController.WorkerTag.GENERATION: proposer_worker,
             NativeGenerationController.WorkerTag.GENERATION: proposer_worker,
         },
     )
@@ -55,40 +64,71 @@ def run_scaffolding_llm(prompts, proposer_worker, controller):
 
 def test_single_vote_controller(prompts,
                                 proposer_worker,
+                                conf_group_size,
+                                conf_threshold,
+                                temperature,
+                                max_tokens,
+                                logprobs_topk,
+                                top_p,
                                 run_type="offline",
                                 **kwargs):
-    DeepConfControllerImpl = DeepConfOfflineController if run_type == "offline" else DeepConfOnlineController
-    prototype_controller = DeepConfControllerImpl(
-        conf_group_size=kwargs.get("conf_group_size"),
-        conf_threshold=kwargs.get("conf_threshold"),
-        logprobs_topk=kwargs.get("logprobs_topk"),
+    generation_controller = NativeGenerationController(
         sampling_params={
-            "temperature": kwargs.get("temperature"),
-            "max_tokens": kwargs.get("max_tokens"),
-            "num_logprobs": kwargs.get("logprobs_topk"),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "num_logprobs": logprobs_topk,
+            "top_p": top_p,
         })
+    DeepConfControllerImpl = _RUN_TYPE_TO_IMPL[run_type]
+    prototype_controller = DeepConfControllerImpl(
+        generation_controller=generation_controller,
+        conf_group_size=conf_group_size,
+        conf_threshold=conf_threshold,
+    )
     run_scaffolding_llm(prompts, proposer_worker, prototype_controller)
 
 
 def test_majority_vote_controller(prompts,
                                   proposer_worker,
+                                  conf_group_size,
+                                  conf_threshold,
+                                  logprobs_topk,
+                                  temperature,
+                                  max_tokens,
+                                  top_p,
+                                  sample_num,
+                                  warmup_sample_num,
+                                  vote_policy,
+                                  confidence_percentile,
                                   run_type="offline_majority_vote",
                                   **kwargs):
-    DeepConfMajorityVoteControllerImpl = DeepConfOfflineMajorityVoteController if run_type == "offline_majority_vote" else DeepConfOnlineMajorityVoteController
-    majority_vote_controller = DeepConfMajorityVoteControllerImpl(
-        sample_num=kwargs.get("sample_num"),
-        conf_group_size=kwargs.get("conf_group_size"),
-        conf_threshold=kwargs.get("conf_threshold"),
-        vote_policy=kwargs.get("vote_policy"),
-        warmup_sample_num=kwargs.get("warmup_sample_num"),
-        confidence_percentile=kwargs.get("confidence_percentile"),
-        logprobs_topk=kwargs.get("logprobs_topk"),
+    generation_controller = NativeGenerationController(
         sampling_params={
-            "temperature": kwargs.get("temperature"),
-            "max_tokens": kwargs.get("max_tokens"),
-            "num_logprobs": kwargs.get("logprobs_topk"),
-            "top_p": kwargs.get("top_p"),
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "num_logprobs": logprobs_topk,
+            "top_p": top_p,
         })
+    DeepConfControllerKwargs = {
+        "generation_controller": generation_controller,
+        "conf_group_size": conf_group_size,
+        "conf_threshold": conf_threshold,
+    }
+    warmup_generation_controller = DeepConfOfflineController(
+        **DeepConfControllerKwargs)
+    final_generation_controller = DeepConfOnlineController(
+        **DeepConfControllerKwargs)
+    DeepConfMajorityVoteControllerImpl = _RUN_TYPE_TO_IMPL[run_type]
+    majority_vote_controller = DeepConfMajorityVoteControllerImpl(
+        generation_controller=warmup_generation_controller,
+        warmup_generation_controller=warmup_generation_controller,
+        final_generation_controller=final_generation_controller,
+        sample_num=sample_num,
+        conf_group_size=conf_group_size,
+        conf_threshold=conf_threshold,
+        vote_policy=vote_policy,
+        warmup_sample_num=warmup_sample_num,
+        confidence_percentile=confidence_percentile)
     run_scaffolding_llm(prompts, proposer_worker, majority_vote_controller)
 
 
@@ -109,8 +149,8 @@ def main():
 
     prompts = [
         "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?\r\n\r\n",
-        # "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
-        # "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
+        "There exist real numbers $x$ and $y$, both greater than 1, such that $\\log_x\\left(y^x\\right)=\\log_y\\left(x^{4y}\\right)=10$. Find $xy$.",
+        "Find the largest possible real part of \\[(75+117i)z+\\frac{96+144i}{z}\\]where $z$ is a complex number with $|z|=4$.",
     ]
 
     scheduler_config = SchedulerConfig(
