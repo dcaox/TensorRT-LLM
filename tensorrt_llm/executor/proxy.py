@@ -182,12 +182,15 @@ class GenerationExecutorProxy(GenerationExecutor):
             else:
                 queue.put(res)
 
+            if not event_loop.is_running():
+                print(f"wrong: {res}")
             # FIXME: Add type annotations and make 'res' type more homogeneous (e.g.
             #        include PostprocWorker.Output in is_llm_response and unify is_final APIs).
             if (is_llm_response(res) and res.result.is_final) or isinstance(
                     res,
                     ErrorResponse) or (isinstance(res, PostprocWorker.Output)
                                        and res.is_final):
+                # print(f"{client_id=} is final")
                 self._results.pop(client_id)
 
         res = res if isinstance(res, list) else [res]
@@ -199,7 +202,12 @@ class GenerationExecutorProxy(GenerationExecutor):
             process_res(i)
 
         if async_queues:
-            _SyncQueue.notify_many(event_loop, async_queues)
+            try:
+                _SyncQueue.notify_many(event_loop, async_queues)
+            except AsyncQueue.EventLoopShutdownError:
+                logger.debug(
+                    "proxy.py: EventLoopShutdownError because event loop is not running"
+                )
 
         return True  # success
 
